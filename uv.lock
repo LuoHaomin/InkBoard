@@ -12,9 +12,9 @@ wheels = [
 ]
 
 [[package]]
-name = "handwriting-tablet"
-version = "0.1.0"
-source = { editable = "." }
+name = "inkboard"
+version = "0.2.0"
+source = { virtual = "." }
 dependencies = [
     { name = "pygame" },
     { name = "pyobjc-framework-quartz" },

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""汉王 N10 Plus 手写板（白板模式）。
+"""墨板 InkBoard（白板模式）— 把电纸书当电脑手写板。
 
-通过 adb 读取设备的 pen_touch 输入节点，实时绘制到本地窗口。
-坐标系 0-1872 x 0-1404，压感 0-1024。
+通过 adb 读取设备的笔输入节点（自动探测节点/量程），实时绘制到本地窗口。
+已实测：汉王 N10 Plus（1872x1404, 压感 1024）、Bigme inknote X color
+（Wacom EMR, 2480x1860, 压感 4095, 笔侧按键=橡皮）。
 """
 
 import argparse
@@ -10,6 +11,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -34,7 +36,7 @@ PEN_MAX_X = 1872
 PEN_MAX_Y = 1404
 PEN_MAX_PRESSURE = 1024
 
-INPUT_DEVICE = "/dev/input/event7"
+INPUT_DEVICE = "/dev/input/event7"  # 默认节点（探测失败时回退，N10 Plus）
 
 # 会话自动保存位置（矢量 JSON，关窗后下次启动恢复）
 SESSION_FILE = os.path.expanduser("~/.hanwang-tablet/autosave.json")
@@ -52,19 +54,54 @@ def _adb(*args, timeout=5) -> str:
                           text=True, timeout=timeout).stdout
 
 
+def probe_pen(serial: str):
+    """探测设备的笔输入节点。返回 (节点, max_x, max_y, max_pressure) 或 None。
+
+    判据：同时具有 ABS_X/ABS_Y/ABS_PRESSURE 和笔类按键
+    （BTN_TOOL_RUBBER / BTN_DIGI / BTN_TOOL_PEN）的输入设备。
+    """
+    try:
+        out = _adb("-s", serial, "shell", "getevent", "-lp", timeout=4)
+    except Exception:  # noqa: BLE001
+        return None
+    for block in out.split("add device")[1:]:
+        if "/dev/input/event" not in block:
+            continue
+        node = block.strip().splitlines()[0].split(":", 1)[1].strip()
+        m_abs = {}
+        for axis in ("ABS_X", "ABS_Y", "ABS_PRESSURE"):
+            m = re.search(rf"{axis}\s*:\s*value\s+\d+.*?max\s+(\d+)", block)
+            if m:
+                m_abs[axis] = int(m.group(1))
+        has_pen_key = any(k in block for k in
+                          ("BTN_TOOL_RUBBER", "BTN_DIGI", "BTN_TOOL_PEN"))
+        if has_pen_key and len(m_abs) == 3:
+            return node, m_abs["ABS_X"], m_abs["ABS_Y"], m_abs["ABS_PRESSURE"]
+    return None
+
+
+def connected_serials() -> list[str]:
+    out = _adb("devices")
+    serials = [line.split()[0] for line in out.splitlines()[1:]
+               if len(line.split()) == 2 and line.split()[1] == "device"]
+    ip = [s for s in serials if "." in s]  # IP 优先（历史习惯），USB 次之
+    return ip + [s for s in serials if s not in ip]
+
+
+def discover_pen():
+    """在所有已连接设备中找到带笔输入的那台。
+    返回 (serial, 节点, max_x, max_y, max_pressure) 或 None。"""
+    for s in connected_serials():
+        info = probe_pen(s)
+        if info:
+            return (s, *info)
+    return None
+
+
 def find_device_serial() -> str | None:
     def scan() -> str | None:
-        out = _adb("devices")
-        for line in out.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) == 2 and parts[1] == "device":
-                if "." in parts[0]:  # 优先 IP 连接（当前唯一稳定通道）
-                    return parts[0]
-        for line in out.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) == 2 and parts[1] == "device":
-                return parts[0]
-        return None
+        serials = connected_serials()
+        return serials[0] if serials else None
 
     dev = scan()
     if dev:
@@ -84,24 +121,29 @@ def find_device_serial() -> str | None:
 
 
 class PenEvent:
-    __slots__ = ("x", "y", "pressure", "down", "rubber")
+    __slots__ = ("x", "y", "pressure", "down", "rubber", "stylus")
 
-    def __init__(self, x: int, y: int, pressure: int, down: bool, rubber: bool):
+    def __init__(self, x: int, y: int, pressure: int, down: bool, rubber: bool,
+                 stylus: bool = False):
         self.x = x
         self.y = y
         self.pressure = pressure
         self.down = down
         self.rubber = rubber
+        self.stylus = stylus  # 笔侧按键(BTN_STYLUS)按住 = 橡皮（无尾橡皮的笔）
 
 
 class PenReader(threading.Thread):
     """后台线程：保持 adb getevent 流存活，解析事件，断线自动重连。"""
 
     def __init__(self, serial: str, out: queue.Queue[PenEvent],
-                 keep_awake: bool = True):
+                 keep_awake: bool = True, device: str = INPUT_DEVICE,
+                 max_pressure: int = PEN_MAX_PRESSURE):
         super().__init__(daemon=True)
         self.serial = serial
         self.out = out
+        self.device = device
+        self.max_pressure = max_pressure
         self.keep_awake = keep_awake
         self._old_timeout: str | None = None
         self.stop_flag = threading.Event()
@@ -114,7 +156,7 @@ class PenReader(threading.Thread):
             try:
                 proc = subprocess.Popen(
                     [resolve_adb(), "-s", self.serial, "shell",
-                     "getevent", "-lt", INPUT_DEVICE],
+                     "getevent", "-lt", self.device],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -145,6 +187,7 @@ class PenReader(threading.Thread):
         x = y = pressure = 0
         down = False
         rubber = False
+        stylus = False
         assert proc.stdout is not None
         for line in proc.stdout:
             if self.stop_flag.is_set():
@@ -174,8 +217,10 @@ class PenReader(threading.Thread):
                     down = value == "DOWN"
                 elif code == "BTN_TOOL_RUBBER":
                     rubber = value == "DOWN"
+                elif code == "BTN_STYLUS":
+                    stylus = value == "DOWN"
             elif ev_type == "EV_SYN" and code == "SYN_REPORT":
-                self.out.put(PenEvent(x, y, pressure, down, rubber))
+                self.out.put(PenEvent(x, y, pressure, down, rubber, stylus))
 
     def stop(self):
         self.stop_flag.set()
@@ -325,8 +370,13 @@ class Whiteboard:
     def __init__(self, width: int, min_pressure: int, pen_size: float,
                  rotation: int = 0, min_mult: float = 0.2,
                  max_mult: float = 2.0, curve_name: str = "适中",
-                 smooth_idx: int = 1):
-        self.pressure_min = min_pressure / PEN_MAX_PRESSURE  # 压感下限(归一化)
+                 smooth_idx: int = 1, pen_max_x: int = PEN_MAX_X,
+                 pen_max_y: int = PEN_MAX_Y,
+                 max_pressure: int = PEN_MAX_PRESSURE):
+        self.pen_max_x = pen_max_x
+        self.pen_max_y = pen_max_y
+        self.max_pressure = max_pressure
+        self.pressure_min = min_pressure / max_pressure  # 压感下限(归一化)
         self.rotation = rotation
         self.min_mult = min_mult
         self.max_mult = max_mult
@@ -342,12 +392,12 @@ class Whiteboard:
         self.last_press = 0.5
         self.prev_angle: float | None = None
         self.window_w = width
-        self.window_h = round(width * PEN_MAX_Y / PEN_MAX_X)
+        self.window_h = round(width * self.pen_max_y / self.pen_max_x)
         if rotation in (90, 270):  # 竖拿时窗口用竖向比例
             self.window_w, self.window_h = self.window_h, self.window_w
 
         pygame.init()
-        pygame.display.set_caption("汉王手写板 — 笔尾即橡皮/画圈圈选删除 | Z撤销 C清空 S保存")
+        pygame.display.set_caption("墨板 InkBoard — 笔尾即橡皮/画圈圈选删除 | Z撤销 C清空 S保存")
         self.screen = pygame.display.set_mode(
             (self.window_w, self.window_h), pygame.RESIZABLE
         )
@@ -395,20 +445,20 @@ class Whiteboard:
     def rotate(self, dx: int, dy: int) -> tuple[int, int]:
         """把设备坐标旋转到窗口朝向（0/90/180/270）。"""
         if self.rotation == 90:
-            return PEN_MAX_Y - dy, dx
+            return self.pen_max_y - dy, dx
         if self.rotation == 180:
-            return PEN_MAX_X - dx, PEN_MAX_Y - dy
+            return self.pen_max_x - dx, self.pen_max_y - dy
         if self.rotation == 270:
-            return dy, PEN_MAX_X - dx
+            return dy, self.pen_max_x - dx
         return dx, dy
 
     def map_point(self, dx: int, dy: int) -> tuple[float, float]:
         rx, ry = self.rotate(dx, dy)
         # 旋转 90/270 后坐标轴对调，分母也要跟着换，否则映射超界
         if self.rotation in (90, 270):
-            max_x, max_y = PEN_MAX_Y, PEN_MAX_X
+            max_x, max_y = self.pen_max_y, self.pen_max_x
         else:
-            max_x, max_y = PEN_MAX_X, PEN_MAX_Y
+            max_x, max_y = self.pen_max_x, self.pen_max_y
         return (rx / max_x * self.canvas_w,
                 ry / max_y * self.canvas_h)
 
@@ -420,7 +470,8 @@ class Whiteboard:
     def _draw_scale(self) -> float:
         """设备单位 → 像素的缩放。以横向映射为基准（旋转后画布宽对应轴互换），
         保证横竖切换时同一笔画的渲染粗细一致；1.5641 校准到旧版默认手感。"""
-        max_x = PEN_MAX_Y if self.rotation in (90, 270) else PEN_MAX_X
+        max_x = (self.pen_max_y if self.rotation in (90, 270)
+                 else self.pen_max_x)
         return (self.canvas_w / max_x) * 1.5641
 
     def _seg(self, pt_a, pt_b, stroke):
@@ -467,7 +518,7 @@ class Whiteboard:
         """Lorien 式采样管线：死区 → 贝塞尔稳定器 → 速度变细 →
         压感限速 → 点优化器。返回接受后的 (x, y, p_norm) 或 None。"""
         x, y = float(ev.x), float(ev.y)
-        p = ev.pressure / PEN_MAX_PRESSURE
+        p = ev.pressure / self.max_pressure
         if not self.stab:  # 每笔第一个点直接透传，无启动延迟
             self.stab = [(x, y)]
             self.last_press = max(p, self.pressure_min)
@@ -519,7 +570,7 @@ class Whiteboard:
             if sampled is None:
                 return
             x, y, p = sampled
-            erasing = self.erasing or ev.rubber
+            erasing = self.erasing or ev.rubber or ev.stylus
             if self.current is None:
                 # 橡皮轨迹不作为笔画存储，只用于切割
                 self.current = Stroke(0 if erasing else self.color_idx,
@@ -726,6 +777,7 @@ class Whiteboard:
             "version": 2,
             "rotation": self.rotation,
             "page": self.page_idx,
+            "pen": [self.pen_max_x, self.pen_max_y],
             "pages": [page_data(p) for p in self.pages],
         }
         os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
@@ -761,6 +813,15 @@ class Whiteboard:
                               for pd in data.get("pages", [])] or [[]]
                 self.page_idx = min(int(data.get("page", 0)),
                                     len(self.pages) - 1)
+                # 换了设备（量程不同）时线性重缩放旧笔记的坐标
+                pen = data.get("pen")
+                if pen and (pen[0] != self.pen_max_x or
+                            pen[1] != self.pen_max_y):
+                    sx, sy = self.pen_max_x / pen[0], self.pen_max_y / pen[1]
+                    for page in self.pages:
+                        for s in page:
+                            s.points = [(x * sx, y * sy, p)
+                                        for x, y, p in s.points]
             else:  # 旧版单页格式
                 self.pages = [self._load_strokes(data.get("strokes", []))]
             self.redraw_all()
@@ -1151,7 +1212,7 @@ def error_dialog(title: str, lines: list[str]):
     """错误提示窗（仅退出按钮）。"""
     pygame.init()
     screen = pygame.display.set_mode((440, 100 + 28 * len(lines)))
-    pygame.display.set_caption("汉王手写板")
+    pygame.display.set_caption("墨板 InkBoard")
     font = pygame.font.SysFont("pingfangsc,hiraginosansgb", 16)
     small = pygame.font.SysFont("pingfangsc,hiraginosansgb", 13)
     quit_btn = pygame.Rect(175, 50 + 28 * len(lines), 90, 40)
@@ -1179,7 +1240,7 @@ def no_device_dialog() -> bool:
     """未发现设备时的提示窗。返回 True=重试，False=退出。"""
     pygame.init()
     screen = pygame.display.set_mode((420, 190))
-    pygame.display.set_caption("汉王手写板")
+    pygame.display.set_caption("墨板 InkBoard")
     font = pygame.font.SysFont("pingfangsc,hiraginosansgb", 16)
     small = pygame.font.SysFont("pingfangsc,hiraginosansgb", 13)
     retry_btn = pygame.Rect(110, 110, 90, 44)
@@ -1198,7 +1259,7 @@ def no_device_dialog() -> bool:
                     pygame.quit()
                     return False
         screen.fill((250, 248, 244))
-        screen.blit(font.render("未发现汉王设备", True, (200, 60, 60)), (110, 24))
+        screen.blit(font.render("未发现电纸书设备", True, (200, 60, 60)), (110, 24))
         screen.blit(small.render("请在设备上打开无线调试页面，确保已连接", True,
                                  (120, 120, 120)), (66, 62))
         screen.blit(small.render("同一网络（必要时先 adb connect / kill-server）",
@@ -1212,29 +1273,44 @@ def no_device_dialog() -> bool:
         clock.tick(30)
 
 
-def start_whiteboard(serial: str | None = None, width: int = 1123,
-                     keep_awake: bool = True):
-    """供 CLI 和 .app 启动器共用的入口。"""
+def discover_pen_or_exit(serial: str | None = None):
+    """找到带笔输入的设备（可指定 serial），失败则弹窗/退出。"""
     try:
-        serial = serial or find_device_serial()
+        found = _discover(serial)
     except FileNotFoundError as e:
         error_dialog("缺少 adb", [str(e)])
         sys.exit(1)
-    while serial is None:
+    while found is None:
         if not no_device_dialog():
             sys.exit(0)
-        serial = find_device_serial()
-    print(f"使用设备: {serial}")
+        found = _discover(None)
+    print(f"使用设备: {found[0]} (笔输入 {found[1]}, "
+          f"{found[2]}x{found[3]}, 压感 {found[4]})")
+    return found
 
+
+def _discover(serial: str | None):
+    if serial is None:
+        return discover_pen()
+    info = probe_pen(serial)
+    return (serial, *info) if info else None
+
+
+def start_whiteboard(serial: str | None = None, width: int = 1123,
+                     keep_awake: bool = True):
+    """供 CLI 和 .app 启动器共用的入口。"""
+    serial, device, max_x, max_y, max_p = discover_pen_or_exit(serial)
     events: queue.Queue[PenEvent] = queue.Queue()
-    reader = PenReader(serial, events, keep_awake=keep_awake)
+    reader = PenReader(serial, events, keep_awake=keep_awake,
+                       device=device, max_pressure=max_p)
     reader.start()
 
-    Whiteboard(width, 50, 6.0).run(events, reader)
+    Whiteboard(width, 50, 6.0, pen_max_x=max_x, pen_max_y=max_y,
+               max_pressure=max_p).run(events, reader)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="汉王 N10 Plus 无线手写板")
+    ap = argparse.ArgumentParser(description="墨板 InkBoard — 电纸书手写板")
     ap.add_argument("--serial", help="adb 设备序列号，默认自动检测")
     ap.add_argument("--width", type=int, default=1123, help="窗口宽度（默认 1123）")
     ap.add_argument("--min-pressure", type=int, default=50,
@@ -1255,23 +1331,26 @@ def main():
     args = ap.parse_args()
 
     try:
-        serial = args.serial or find_device_serial()
+        found = _discover(args.serial)
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
-    if not serial:
-        print("未发现 adb 设备，请先: adb connect <设备IP>:<端口>", file=sys.stderr)
+    if found is None:
+        print("未发现带笔输入的 adb 设备", file=sys.stderr)
         sys.exit(1)
-    print(f"使用设备: {serial}")
+    serial, device, max_x, max_y, max_p = found
+    print(f"使用设备: {serial} (笔输入 {device}, {max_x}x{max_y}, 压感 {max_p})")
 
     events: queue.Queue[PenEvent] = queue.Queue()
-    reader = PenReader(serial, events, keep_awake=not args.no_keep_awake)
+    reader = PenReader(serial, events, keep_awake=not args.no_keep_awake,
+                       device=device, max_pressure=max_p)
     reader.start()
 
     smooth_idx = [n for n, _ in SMOOTH_LEVELS].index(args.smooth)
     Whiteboard(args.width, args.min_pressure, args.pen_size,
                args.rotation, args.min_mult, args.max_mult,
-               args.curve, smooth_idx).run(events, reader)
+               args.curve, smooth_idx, pen_max_x=max_x, pen_max_y=max_y,
+               max_pressure=max_p).run(events, reader)
 
 
 if __name__ == "__main__":

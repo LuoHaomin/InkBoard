@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成 HanwangTablet.app 图标：纸面底色 + 变宽墨迹笔画 + 红印章点。
+"""生成 InkBoard.app 图标：纸面底色 + 变宽墨迹笔画 + 红印章点。
 
 2048 超采样绘制后缩到各档尺寸，输出 icns 所需的 iconset 目录。
 用法: uv run python icon.py
@@ -68,7 +68,7 @@ def draw_icon(size: int) -> pygame.Surface:
 
 def main():
     pygame.init()
-    iconset = "HanwangTablet.iconset"
+    iconset = "InkBoard.iconset"
     os.makedirs(iconset, exist_ok=True)
     for sz in (16, 32, 128, 256, 512):
         pygame.image.save(draw_icon(sz), f"{iconset}/icon_{sz}x{sz}.png")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""汉王手写板 .app 启动器：选择白板模式或鼠标模式。"""
+"""墨板 InkBoard .app 启动器：选择白板模式或鼠标模式。"""
 
 import pygame
 
@@ -10,7 +10,7 @@ import mousepad
 def run():
     pygame.init()
     screen = pygame.display.set_mode((360, 240))
-    pygame.display.set_caption("汉王手写板")
+    pygame.display.set_caption("墨板 InkBoard")
     font = pygame.font.SysFont("pingfangsc,hiraginosansgb", 18)
     small = pygame.font.SysFont("pingfangsc,hiraginosansgb", 13)
 
@@ -35,7 +35,7 @@ def run():
                         return
 
         screen.fill((250, 248, 244))
-        screen.blit(font.render("汉王 N10 Plus 手写板", True, (30, 30, 34)),
+        screen.blit(font.render("墨板 InkBoard — 电纸书手写板", True, (30, 30, 34)),
                     (30, 20))
         screen.blit(small.render("请选择模式（需已 adb connect 设备）", True,
                                  (120, 120, 120)), (30, 210))

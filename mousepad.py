@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""汉王 N10 Plus 鼠标模式（无压感）。
+"""墨板 · 鼠标模式（无压感）。
 
 把笔的绝对坐标映射到主显示器，笔尖接触/抬起 = 鼠标左键按下/抬起，
 笔尾橡皮 = 鼠标右键。
@@ -34,14 +34,28 @@ from Quartz import (
 )
 from Quartz.CoreGraphics import CGDisplayPixelsWide, CGDisplayPixelsHigh
 
-from main import (PEN_MAX_X, PEN_MAX_Y, PenEvent, PenReader,
-                  find_device_serial, no_device_dialog, error_dialog)
+from main import (PenEvent, PenReader, discover_pen, probe_pen,
+                  no_device_dialog, error_dialog)
+
+
+def probe_pen_safe(serial):
+    try:
+        return probe_pen(serial)
+    except FileNotFoundError:
+        raise
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class MouseMapper:
-    def __init__(self, full_screen: bool, rotation: int = 0):
+    def __init__(self, full_screen: bool, rotation: int = 0,
+                 pen_max_x: int = 1872, pen_max_y: int = 1404,
+                 max_pressure: int = 1024):
         self.full_screen = full_screen
         self.rotation = rotation
+        self.pen_max_x = pen_max_x
+        self.pen_max_y = pen_max_y
+        self.max_pressure = max_pressure
         display_id = CGMainDisplayID()
         self.screen_w = CGDisplayPixelsWide(display_id)
         self.screen_h = CGDisplayPixelsHigh(display_id)
@@ -50,7 +64,7 @@ class MouseMapper:
             self.area_w, self.area_h = self.screen_w, self.screen_h
         else:
             # N10 是 4:3，按比例居中映射保持手感
-            area_ratio = PEN_MAX_X / PEN_MAX_Y
+            area_ratio = self.pen_max_x / self.pen_max_y
             screen_ratio = self.screen_w / self.screen_h
             if screen_ratio > area_ratio:
                 self.area_h = self.screen_h
@@ -66,13 +80,13 @@ class MouseMapper:
     def to_screen(self, ev: PenEvent):
         dx, dy = ev.x, ev.y
         if self.rotation == 90:
-            dx, dy = PEN_MAX_Y - dy, dx
+            dx, dy = self.pen_max_y - dy, dx
         elif self.rotation == 180:
-            dx, dy = PEN_MAX_X - dx, PEN_MAX_Y - dy
+            dx, dy = self.pen_max_x - dx, self.pen_max_y - dy
         elif self.rotation == 270:
-            dx, dy = dy, PEN_MAX_X - dx
-        x = self.off_x + dx / PEN_MAX_X * self.area_w
-        y = self.off_y + dy / PEN_MAX_Y * self.area_h
+            dx, dy = dy, self.pen_max_x - dx
+        x = self.off_x + dx / self.pen_max_x * self.area_w
+        y = self.off_y + dy / self.pen_max_y * self.area_h
         return x, y
 
     def post(self, kind, x, y, button=0, pressure: float | None = None):
@@ -88,7 +102,7 @@ class MouseMapper:
 
     def handle(self, ev: PenEvent):
         x, y = self.to_screen(ev)
-        p = ev.pressure / 1024 if ev.down else None
+        p = ev.pressure / self.max_pressure if ev.down else None
         if ev.rubber:
             kind = (kCGEventRightMouseDragged if self.right_down
                     else kCGEventRightMouseDown)
@@ -115,23 +129,26 @@ def start_mousepad(serial: str | None = None, full_screen: bool = False,
                    rotation: int = 0):
     """带小状态窗口运行，供 CLI 和 .app 启动器共用。"""
     try:
-        serial = serial or find_device_serial()
+        found = discover_pen() if serial is None else \
+            (lambda p: (serial, *p) if p else None)(probe_pen_safe(serial))
     except FileNotFoundError as e:
         error_dialog("缺少 adb", [str(e)])
         sys.exit(1)
-    while serial is None:
+    while found is None:
         if not no_device_dialog():
             sys.exit(0)
-        serial = find_device_serial()
+        found = discover_pen()
+    serial, device, max_x, max_y, max_pressure = found
 
-    mapper = MouseMapper(full_screen, rotation)
+    mapper = MouseMapper(full_screen, rotation, max_x, max_y, max_pressure)
     pygame.init()
     screen = pygame.display.set_mode((380, 150))
-    pygame.display.set_caption("汉王鼠标模式")
+    pygame.display.set_caption("墨板 · 鼠标模式")
     font = pygame.font.SysFont("pingfangsc,hiraginosansgb", 14)
 
     events: queue.Queue = queue.Queue()
-    reader = PenReader(serial, events)
+    reader = PenReader(serial, events, device=device,
+                       max_pressure=max_pressure)
     reader.start()
 
     clock = pygame.time.Clock()
@@ -161,7 +178,7 @@ def start_mousepad(serial: str | None = None, full_screen: bool = False,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="汉王 N10 Plus 鼠标模式（无压感）")
+    ap = argparse.ArgumentParser(description="墨板 · 鼠标模式（无压感）")
     ap.add_argument("--serial", help="adb 设备序列号，默认自动检测")
     ap.add_argument("--full-screen", action="store_true",
                     help="笔区铺满整个屏幕（默认按 4:3 居中映射）")
