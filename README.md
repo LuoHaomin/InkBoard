@@ -45,6 +45,17 @@ uv run python mousepad.py    # 鼠标模式
 - 连接期间自动保持设备唤醒（`--no-keep-awake` 关闭）
 - 建议关闭设备自动锁屏；鼠标模式需在系统设置→辅助功能中授权
 
+## 导出电纸书自带笔记
+
+```bash
+uv run python export_notes.py
+```
+
+把汉王设备 `/sdcard/notes` 里的手写笔记批量导出到桌面（PNG + 矢量 SVG）。
+`.psl` 笔迹格式已完整逆向（`NPSL0001`，大端 float32 点序列），首次运行拉取缓存
+（~44MB 存于 `~/.hanwang-tablet/notes-cache`），重复运行直接用缓存；
+`--min-stroke` 控制草稿过滤，`--png-only` 只导位图。
+
 ## 参数
 
 ```
